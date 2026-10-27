@@ -1,0 +1,65 @@
+# 1. Purge any existing PHP so we control the exact version
+sudo apt-get purge -y 'php*' 'libapache2-mod-php*' 2>/dev/null || true
+sudo apt-get autoremove -y
+
+# 2. Install a vulnerable build: PHP 8.1 (EOL, unpatched) + nginx
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx php8.1-fpm php8.1-cli
+php -v   # must be 8.1.x — below every patched release (8.2.35/8.3.36/8.4.27/8.5.12)
+
+# 3. Trivial target app (bug is in the engine, app code never runs)
+sudo mkdir -p /var/www/html
+sudo tee /var/www/html/pwn.php > /dev/null <<'EOF'
+<?php echo "php2shell target ok\n";
+EOF
+sudo tee /var/www/html/index.php > /dev/null <<'EOF'
+<?php echo "php2shell target ok\n";
+EOF
+
+# 4. php.ini: easy OOM, big enough post_max_size to let the 32MB body in, show fatals
+sudo sed -ri  's|^memory_limit *=.*|memory_limit = 16M|'        /etc/php/8.1/fpm/php.ini
+sudo sed -ri  's|^post_max_size *=.*|post_max_size = 64M|'      /etc/php/8.1/fpm/php.ini
+sudo sed -ri  's|^;?max_input_vars *=.*|max_input_vars = 1000000|' /etc/php/8.1/fpm/php.ini
+sudo sed -ri  's|^;?display_errors *=.*|display_errors = On|'   /etc/php/8.1/fpm/php.ini
+
+# 5. FPM pool: exactly ONE worker so request N+1 reuses the process that just fataled
+sudo tee /etc/php/8.1/fpm/pool.d/www.conf > /dev/null <<'EOF'
+[www]
+user = www-data
+group = www-data
+listen = /run/php/php8.1-fpm.sock
+pm = static
+pm.max_children = 1
+pm.process_idle_timeout = 30s
+request_terminate_timeout = 0
+EOF
+
+# 6. nginx: serve the app, unlimited request body
+sudo tee /etc/nginx/sites-available/php2shell > /dev/null <<'EOF'
+server {
+    listen 80 default_server;
+    server_name _;
+    root /var/www/html;
+    index index.php;
+    client_max_body_size 0;
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php8.1-fpm.sock;
+    }
+}
+EOF
+sudo ln -sfn /etc/nginx/sites-available/php2shell /etc/nginx/sites-enabled/php2shell
+sudo rm -f /etc/nginx/sites-enabled/default
+
+# 7. Start
+sudo systemctl restart php8.1-fpm
+sudo systemctl restart nginx
+
+# 8. Sanity checks
+curl -s http://127.0.0.1/pwn.php                      # -> php2shell target ok
+ps aux | grep '[p]hp-fpm: pool'                       # exactly one worker
+head -c 33554432 /dev/zero | tr '\0' ';' > /tmp/big.bin
+curl -s -o /dev/null -w '%{http_code}\n' -X POST --data-binary @/tmp/big.bin http://127.0.0.1/pwn.php
+# -> 500, and:
+sudo tail -3 /var/log/php8.1-fpm.log                  # -> "Allowed memory size of 16777216 bytes exhausted"
