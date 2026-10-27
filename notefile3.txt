@@ -1,0 +1,67 @@
+# --- install (or reinstall) default PHP-FPM + nginx ---
+sudo apt-get update
+sudo apt-get purge -y 'php*' 'libapache2-mod-php*' 2>/dev/null || true
+sudo apt-get autoremove -y
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx php-fpm php-cli
+
+# derive version dir, e.g. 7.4 / 8.1 / 8.3
+PHPV=$(ls -d /etc/php/*/fpm 2>/dev/null | head -n1 | sed -E 's|^/etc/php/([^/]+)/fpm$|\1|')
+echo "Using /etc/php/$PHPV/fpm"
+php -v
+
+
+# --- trivial target app ---
+sudo mkdir -p /var/www/html
+sudo tee /var/www/html/pwn.php > /dev/null <<'EOF'
+<?php echo "php2shell target ok\n";
+EOF
+sudo tee /var/www/html/index.php > /dev/null <<'EOF'
+<?php echo "php2shell target ok\n";
+EOF
+
+# --- php.ini: easy OOM + big body + show fatals ---
+sudo sed -ri 's|^memory_limit *=.*|memory_limit = 16M|'             /etc/php/$PHPV/fpm/php.ini
+sudo sed -ri 's|^post_max_size *=.*|post_max_size = 64M|'           /etc/php/$PHPV/fpm/php.ini
+sudo sed -ri 's|^;?max_input_vars *=.*|max_input_vars = 1000000|'   /etc/php/$PHPV/fpm/php.ini
+sudo sed -ri 's|^;?display_errors *=.*|display_errors = On|'        /etc/php/$PHPV/fpm/php.ini
+
+# --- FPM pool: exactly one worker (needed for the stale-state CVE) ---
+sudo tee /etc/php/$PHPV/fpm/pool.d/www.conf > /dev/null <<EOF
+[www]
+user = www-data
+group = www-data
+listen = /run/php/php${PHPV}-fpm.sock
+pm = static
+pm.max_children = 1
+pm.process_idle_timeout = 30s
+request_terminate_timeout = 0
+EOF
+
+# --- nginx ---
+sudo tee /etc/nginx/sites-available/php2shell > /dev/null <<EOF
+server {
+    listen 80 default_server;
+    server_name _;
+    root /var/www/html;
+    index index.php;
+    client_max_body_size 0;
+
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php${PHPV}-fpm.sock;
+    }
+}
+EOF
+sudo ln -sfn /etc/nginx/sites-available/php2shell /etc/nginx/sites-enabled/php2shell
+sudo rm -f /etc/nginx/sites-enabled/default
+
+# --- start ---
+sudo systemctl restart php${PHPV}-fpm
+sudo systemctl restart nginx
+
+# --- sanity checks ---
+curl -s http://127.0.0.1/pwn.php
+ps aux | grep '[p]hp-fpm'
+head -c 33554432 /dev/zero | tr '\0' ';' > /tmp/big.bin
+curl -s -o /dev/null -w '%{http_code}\n' -X POST --data-binary @/tmp/big.bin http://127.0.0.1/pwn.php
+sudo tail -3 /var/log/php${PHPV}-fpm.log
